@@ -142,3 +142,42 @@ uploaded = st.file_uploader("워드(.docx) 업로드", type=["docx"])
 
 if uploaded is not None:
     try:
+        data = uploaded.read()
+        doc = Document(io.BytesIO(data))
+
+        orders_file, warnings = build_orders_json_multi(doc)
+
+        st.success("변환 성공!")
+        st.write(f"출고건수: **{len(orders_file['orders'])}**")
+
+        # 요약 테이블
+        summary = [
+            {"orderId": o["orderId"], "items": len(o["items"])}
+            for o in orders_file["orders"]
+        ]
+        st.subheader("출고별 상품 건수 요약")
+        st.dataframe(summary, use_container_width=True)
+
+        if warnings:
+            st.warning("경고/확인 필요")
+            for w in warnings[:50]:
+                st.write(f"- {w}")
+            if len(warnings) > 50:
+                st.write(f"... (총 {len(warnings)}개 경고 중 일부만 표시)")
+
+        st.subheader("orders.json 미리보기")
+        st.code(json.dumps(orders_file, ensure_ascii=False, indent=2), language="json")
+
+        out_bytes = json.dumps(orders_file, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button(
+            label="orders.json 다운로드",
+            data=out_bytes,
+            file_name="orders.json",
+            mime="application/json"
+        )
+
+    except Exception as e:
+        st.error("변환 중 오류가 발생했습니다.")
+        st.code(str(e))
+else:
+    st.caption("워드 파일을 업로드하면 변환이 시작됩니다.")
