@@ -9,172 +9,136 @@ from docx import Document
 
 
 def norm(s: str) -> str:
-    # 필요하면 하이픈/공백 제거 규칙을 통일할 수 있어요.
     return str(s).strip()
 
 
-def extract_ship_id(doc: Document) -> Optional[str]:
-    """
-    문서 전체에서 '출고주문번호:' 다음 값을 찾는다.
-    예: '출고주문번호: OUT-0001'
-    """
-    pattern = re.compile(r"출고주문번호[:\s]*([A-Za-z0-9\-]+)")
+SHIP_RE = re.compile(r"출고주문번호[:\s]*([A-Za-z0-9\-]+)")
+
+
+def find_ship_ids_in_order(doc: Document) -> List[str]:
+    """문서 전체에서 출고주문번호를 등장 순서대로 수집(중복 제거)."""
+    ids: List[str] = []
     for p in doc.paragraphs:
-        m = pattern.search(p.text)
+        m = SHIP_RE.search(p.text)
         if m:
-            return norm(m.group(1))
-    return None
+            ship = norm(m.group(1))
+            if ship and (not ids or ids[-1] != ship):
+                ids.append(ship)
+    return ids
 
 
-def parse_items_from_tables(doc: Document) -> Tuple[List[Dict], List[str]]:
+def table_headers(table) -> List[str]:
+    if not table.rows:
+        return []
+    return [norm(c.text) for c in table.rows[0].cells]
+
+
+def parse_items_from_table(table) -> Tuple[List[Dict], List[str]]:
     """
-    표 헤더에서 '주문상품', '주문수량', '상품 바코드' 컬럼을 찾아
-    각 행을 items로 변환한다.
-    반환:
-      items: [{barcode, name, qty}, ...]
-      warnings: 경고 메시지 리스트
+    한 개 표에서 items 추출.
+    - name: '주문상품' 우선
+    - qty: '주문수량'
+    - barcode: '상품 바코드'가 있으면 우선, 없으면 '상품연동코드' 사용
     """
-    items: List[Dict] = []
     warnings: List[str] = []
+    headers = table_headers(table)
+    if not headers:
+        return [], warnings
 
-    wanted = ["주문상품", "주문수량", "상품 바코드"]
+    # 필수
+    if "주문상품" not in headers or "주문수량" not in headers:
+        return [], warnings
 
-    found_any_table = False
-    for table in doc.tables:
-        if not table.rows:
+    idx_name = headers.index("주문상품")
+    idx_qty = headers.index("주문수량")
+
+    # 바코드 컬럼 후보들
+    barcode_idx = None
+    if "상품 바코드" in headers:
+        barcode_idx = headers.index("상품 바코드")
+    elif "상품연동코드" in headers:
+        barcode_idx = headers.index("상품연동코드")
+        warnings.append("표에 '상품 바코드' 컬럼이 없어 '상품연동코드'를 barcode로 사용합니다.")
+
+    items: List[Dict] = []
+    for r_i, row in enumerate(table.rows[1:], start=2):
+        cells = [norm(c.text) for c in row.cells]
+        if len(cells) <= max(idx_name, idx_qty, (barcode_idx or 0)):
             continue
 
-        headers = [norm(c.text) for c in table.rows[0].cells]
-        if not all(w in headers for w in wanted):
+        name = norm(cells[idx_name])
+        qty_raw = norm(cells[idx_qty])
+        m = re.search(r"\d+", qty_raw)
+        qty = int(m.group(0)) if m else 0
+
+        # 합계 행 스킵
+        if "합계" in name:
             continue
 
-        found_any_table = True
-        idx_name = headers.index("주문상품")
-        idx_qty = headers.index("주문수량")
-        idx_barcode = headers.index("상품 바코드")
+        if qty <= 0:
+            continue
 
-        for r_i, row in enumerate(table.rows[1:], start=2):  # 1-based row number 느낌
-            cells = [norm(c.text) for c in row.cells]
-            if len(cells) <= max(idx_name, idx_qty, idx_barcode):
-                continue
+        barcode = ""
+        if barcode_idx is not None:
+            barcode = norm(cells[barcode_idx])
 
-            name = norm(cells[idx_name])
-            barcode = norm(cells[idx_barcode])
+        # barcode가 비면 검증 불가라 제외(필요하면 포함하도록 바꿀 수 있음)
+        if not barcode:
+            warnings.append(f"표 {r_i}행: barcode가 비어 있어 제외됨 (상품='{name}')")
+            continue
 
-            # qty 파싱 (워드 표에 이상한 공백/줄바꿈이 있을 수 있어서 숫자만 추출)
-            qty_raw = norm(cells[idx_qty])
-            m = re.search(r"\d+", qty_raw)
-            qty = int(m.group(0)) if m else 0
-
-            # 합계 행/빈 행 방지
-            if not name and not barcode:
-                continue
-            if "합계" in name:
-                continue
-
-            if qty <= 0:
-                warnings.append(f"표 {r_i}행: 수량 파싱 실패(값='{qty_raw}') → 건너뜀")
-                continue
-
-            if not barcode:
-                warnings.append(f"표 {r_i}행: 상품 바코드가 비어있음(상품='{name}')")
-                # 바코드 없는 건은 검증 불가라서 기본은 제외
-                continue
-
-            items.append({
-                "barcode": barcode,
-                "name": name if name else "(상품명 없음)",
-                "qty": qty
-            })
-
-    if not found_any_table:
-        warnings.append("필요한 헤더(주문상품/주문수량/상품 바코드)가 있는 표를 찾지 못했습니다.")
+        items.append({"barcode": barcode, "name": name or "(상품명 없음)", "qty": qty})
 
     return items, warnings
 
 
-def build_orders_json(doc: Document) -> Tuple[Dict, List[str]]:
+def build_orders_json_multi(doc: Document) -> Tuple[Dict, List[str]]:
     warnings: List[str] = []
+    ship_ids = find_ship_ids_in_order(doc)
 
-    ship_id = extract_ship_id(doc)
-    if not ship_id:
-        warnings.append("문서에서 '출고주문번호'를 찾지 못했습니다. (예: '출고주문번호: OUT-0001')")
-        ship_id = "UNKNOWN"
+    if not ship_ids:
+        warnings.append("문서에서 '출고주문번호'를 하나도 찾지 못했습니다.")
+        ship_ids = ["UNKNOWN"]
 
-    items, w2 = parse_items_from_tables(doc)
-    warnings.extend(w2)
+    # 전략: 문서에 있는 표들을 순서대로 훑어서, "출고번호 수"만큼 표를 매칭해본다.
+    # (대부분 출고번호 1개당 표 1개 구조라서 잘 맞습니다.)
+    tables = list(doc.tables)
 
-    orders_file = {
-        "date": str(date.today()),
-        "orders": [
-            {
-                "orderId": ship_id,
-                "items": items
-            }
-        ]
-    }
+    orders: List[Dict] = []
+    table_cursor = 0
 
-    if not items:
-        warnings.append("추출된 상품(item)이 0건입니다. 워드 표 구조/헤더명을 확인하세요.")
+    for ship in ship_ids:
+        items: List[Dict] = []
+        local_warn: List[str] = []
 
-    return orders_file, warnings
+        # 다음에 나오는 "유효한(주문상품/주문수량 포함)" 표를 찾는다
+        while table_cursor < len(tables):
+            t = tables[table_cursor]
+            table_cursor += 1
+
+            it, w = parse_items_from_table(t)
+            if it:
+                items = it
+                local_warn.extend(w)
+                break
+            else:
+                # items가 0이어도 headers 경고는 굳이 쌓지 않음
+                continue
+
+        if not items:
+            local_warn.append(f"{ship}: 매칭되는 상품 표를 찾지 못했거나, 표에서 상품을 추출하지 못했습니다.")
+
+        orders.append({"orderId": ship, "items": items})
+        warnings.extend(local_warn)
+
+    out = {"date": str(date.today()), "orders": orders}
+    return out, warnings
 
 
 st.set_page_config(page_title="DOCX → orders.json 변환", layout="centered")
-st.title("워드(.docx) → orders.json 변환기 (오프라인 피킹앱용)")
-
-st.write(
-    "1) 워드(.docx) 파일을 업로드하면\n"
-    "2) 출고번호(orderId) + 상품바코드/수량을 추출해서\n"
-    "3) `orders.json` 파일로 만들어 다운로드할 수 있습니다."
-)
+st.title("워드(.docx) → orders.json 변환기 (멀티 출고 지원)")
 
 uploaded = st.file_uploader("워드(.docx) 업로드", type=["docx"])
 
 if uploaded is not None:
     try:
-        data = uploaded.read()
-        doc = Document(io.BytesIO(data))
-
-        orders_file, warnings = build_orders_json(doc)
-
-        ship_id = orders_file["orders"][0]["orderId"]
-        items = orders_file["orders"][0]["items"]
-
-        st.success("변환 성공!")
-        st.subheader("추출 결과 요약")
-        st.write(f"- 출고번호(orderId): **{ship_id}**")
-        st.write(f"- 상품(item) 건수: **{len(items)}**")
-
-        if warnings:
-            st.warning("경고/확인 필요")
-            for w in warnings:
-                st.write(f"- {w}")
-
-        if items:
-            st.subheader("상품 리스트(미리보기)")
-            st.dataframe(items, use_container_width=True)
-
-        st.subheader("orders.json 미리보기")
-        st.code(json.dumps(orders_file, ensure_ascii=False, indent=2), language="json")
-
-        # 다운로드 버튼
-        out_bytes = json.dumps(orders_file, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button(
-            label="orders.json 다운로드",
-            data=out_bytes,
-            file_name="orders.json",
-            mime="application/json"
-        )
-
-        st.info("다운로드한 orders.json을 피킹앱에서 'orders.json 업로드' 버튼으로 넣으면 됩니다.")
-
-    except Exception as e:
-        st.error("변환 중 오류가 발생했습니다.")
-        st.code(str(e))
-        st.write("✅ 확인사항:")
-        st.write("- 업로드한 파일이 진짜 `.docx`인지 (워드에서 '다른 이름으로 저장'으로 docx로 저장)")
-        st.write("- 문서에 '출고주문번호:' 문구가 있는지")
-        st.write("- 표 헤더에 '주문상품', '주문수량', '상품 바코드'가 정확히 있는지")
-else:
-    st.caption("워드 파일을 업로드하면 여기서 변환이 시작됩니다.")
